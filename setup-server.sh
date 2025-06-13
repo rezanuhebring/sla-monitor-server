@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# SLA Monitor - Central Server Setup Script (with Dependency Installation)
+# SLA Monitor - Interactive Server Setup Script (HTTP or HTTPS)
 # ==============================================================================
 
 # --- Colors for Output ---
@@ -10,103 +10,109 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 # --- Pre-run Check ---
-# Check if the script is run as root
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}Please run this script with sudo or as root.${NC}"
-  echo "Usage: sudo ./setup-server.sh"
   exit 1
 fi
 
-# --- Helper Functions ---
-install_dependency() {
-    local dep_name=$1
-    echo -e "${YELLOW}Dependency '$dep_name' not found. Attempting installation...${NC}"
+# ==============================================================================
+# --- HTTPS Setup Function ---
+# ==============================================================================
+setup_https() {
+    echo -e "\n${YELLOW}--- Starting HTTPS Setup ---${NC}"
     
-    # Update package list before first install
-    if [ "$first_install" = true ]; then
-        echo "Updating package lists..."
-        apt-get update -y > /dev/null
-        first_install=false
+    # 1. Gather User Input
+    read -p "Enter your base domain name (e.g., my-monitor.com): " BASE_DOMAIN
+    read -p "Enter your email for SSL notifications: " USER_EMAIL
+    if [ -z "$BASE_DOMAIN" ] || [ -z "$USER_EMAIL" ]; then
+        echo -e "${RED}Error: Domain and email cannot be empty for HTTPS setup.${NC}"; exit 1
     fi
 
-    case $dep_name in
-        git)
-            apt-get install -y git
-            ;;
-        docker)
-            apt-get install -y apt-transport-https ca-certificates curl software-properties-common
-            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-            apt-get update -y > /dev/null
-            apt-get install -y docker-ce docker-ce-cli containerd.io
-            # Add current user to docker group
-            usermod -aG docker ${SUDO_USER:-$(whoami)}
-            echo -e "${YELLOW}NOTE: You may need to log out and log back in for Docker group changes to take effect.${NC}"
-            ;;
-        docker-compose)
-            # Install Docker Compose v2 (recommended)
-            apt-get install -y docker-compose-plugin
-            ;;
-    esac
+    GRAFANA_DOMAIN="grafana.$BASE_DOMAIN"
+    API_DOMAIN="api.$BASE_DOMAIN"
+    INFLUX_DOMAIN="influx.$BASE_DOMAIN"
 
-    if ! command -v $dep_name &> /dev/null; then
-        echo -e "${RED}Failed to install '$dep_name'. Please install it manually and re-run the script.${NC}"
-        exit 1
-    fi
-    echo -e "${GREEN}'$dep_name' installed successfully.${NC}"
+    echo -e "\nServices will be at: https://$GRAFANA_DOMAIN, https://$API_DOMAIN, https://$INFLUX_DOMAIN"
+    read -p "Is this correct? (y/n): " -n 1 -r; echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Setup aborted."; exit 1; fi
+
+    # 2. Generate Nginx Config
+    echo -e "\nGenerating Nginx configuration..."
+    if [ ! -d "nginx/conf" ]; then mkdir -p nginx/conf; fi
+    sed -e "s/_GRAFANA_DOMAIN_/$GRAFANA_DOMAIN/g" -e "s/_API_DOMAIN_/$API_DOMAIN/g" -e "s/_INFLUX_DOMAIN_/$INFLUX_DOMAIN/g" \
+        nginx/conf/default.conf.template > nginx/conf/default.conf
+
+    # 3. Launch Services using the HTTPS compose file
+    echo -e "\nLaunching Docker services with Nginx..."
+    docker-compose -f docker-compose.https.yml up -d --force-recreate
+    if [ $? -ne 0 ]; then echo -e "${RED}Docker Compose failed.${NC}"; exit 1; fi
+
+    # 4. Obtain SSL Certificates
+    echo -e "\nRequesting SSL certificates from Let's Encrypt..."
+    docker-compose -f docker-compose.https.yml run --rm certbot certonly --webroot --webroot-path /var/www/certbot \
+        --email $USER_EMAIL --agree-tos --no-eff-email \
+        -d $GRAFANA_DOMAIN -d $API_DOMAIN -d $INFLUX_DOMAIN
+    if [ $? -ne 0 ]; then echo -e "${RED}Certbot failed. Check your DNS records and firewall.${NC}"; exit 1; fi
+
+    # 5. Final Restart
+    echo -e "\nRestarting Nginx to apply SSL..."
+    docker-compose -f docker-compose.https.yml restart nginx
+
+    # 6. Final Instructions
+    echo -e "\n${GREEN}--- HTTPS Setup Complete! ---${NC}"
+    echo "Grafana Dashboard: ${GREEN}https://$GRAFANA_DOMAIN${NC}"
+    echo "API Endpoint:      ${GREEN}https://$API_DOMAIN/api/submit${NC}"
+    echo "InfluxDB UI:       ${GREEN}https://$INFLUX_DOMAIN${NC}"
+    echo -e "\n${YELLOW}IMPORTANT: Update your agent's 'config.ini' with the new API URL.${NC}"
 }
 
-echo -e "${GREEN}Starting SLA Monitor Server Setup...${NC}\n"
+# ==============================================================================
+# --- HTTP Setup Function ---
+# ==============================================================================
+setup_http() {
+    echo -e "\n${YELLOW}--- Starting HTTP-Only Setup ---${NC}"
+    
+    # Launch Services using the HTTP compose file
+    docker-compose -f docker-compose.http.yml up -d
+    if [ $? -ne 0 ]; then echo -e "${RED}Docker Compose failed.${NC}"; exit 1; fi
 
-# 1. Check for and install required dependencies
-echo "Step 1: Checking for dependencies..."
-first_install=true
-dependencies=("git" "docker" "docker-compose")
-for dep in "${dependencies[@]}"; do
-    if ! command -v $dep &> /dev/null; then
-        install_dependency $dep
-    else
-        echo -e "Dependency '$dep' is already installed."
-    fi
-done
-echo -e "${GREEN}All dependencies are present.${NC}\n"
+    SERVER_IP=$(hostname -I | awk '{print $1}')
 
-# --- The rest of the script is the same as before ---
+    # Final Instructions
+    echo -e "\n${GREEN}--- HTTP Setup Complete! ---${NC}"
+    echo "Grafana Dashboard: ${GREEN}http://$SERVER_IP:3000${NC}"
+    echo "API Endpoint:      ${GREEN}http://$SERVER_IP:8000/api/submit${NC}"
+    echo "InfluxDB UI:       ${GREEN}http://$SERVER_IP:8086${NC}"
+    echo -e "\n${YELLOW}IMPORTANT: Update your agent's 'config.ini' with the API URL.${NC}"
+}
 
-# 2. Set up the environment configuration
-echo "Step 2: Setting up configuration..."
-if [ -f ".env" ]; then
-    echo -e "${YELLOW}'.env' file already exists. Skipping creation.${NC}"
-else
-    echo "Creating .env file from .env.example..."
+# ==============================================================================
+# --- Main Script Logic ---
+# ==============================================================================
+echo -e "${GREEN}--- Welcome to the SLA Monitor Server Setup ---${NC}"
+
+# Stop any existing containers to prevent conflicts
+echo "Stopping any existing monitor containers..."
+docker-compose -f docker-compose.https.yml down 2>/dev/null
+docker-compose -f docker-compose.http.yml down 2>/dev/null
+
+# Set up .env file
+if [ ! -f ".env" ]; then
     cp .env.example .env
-    # Set correct ownership for the folder
-    chown -R ${SUDO_USER:-$(whoami)}:${SUDO_USER:-$(whoami)} .
-    echo -e "${GREEN}.env file created. You can edit this file later to change your secrets.${NC}"
-fi
-echo ""
-
-# 3. Launch the Docker containers
-echo "Step 3: Building and launching Docker containers..."
-echo "This may take a few minutes on the first run..."
-docker-compose up -d
-
-if [ $? -ne 0 ]; then
-    echo -e "\n${RED}Docker Compose failed to start. Please check the output for errors.${NC}"
-    exit 1
+    echo -e "${GREEN}.env file created.${NC}"
 fi
 
-echo -e "\n${GREEN}=====================================================${NC}"
-echo -e "${GREEN}  SLA Monitor Server Setup Complete!               ${NC}"
-echo -e "${GREEN}=====================================================${NC}\n"
-
-# 4. Display status and next steps
-echo "Verifying services are running..."
-docker-compose ps
-SERVER_IP=$(hostname -I | awk '{print $1}')
-echo -e "\n${YELLOW}--- Your Services ---${NC}"
-echo -e "API Server is running at:      ${GREEN}http://${SERVER_IP}:8000${NC}"
-echo -e "Grafana Dashboard is at:     ${GREEN}http://${SERVER_IP}:3000${NC}"
-echo -e "\n${YELLOW}--- Next Steps ---${NC}"
-echo "1. Configure the Agent's 'config.ini' to point to the API URL: ${GREEN}api_url = http://${SERVER_IP}:8000/api/submit${NC}"
+# Ask the user for setup type
 echo ""
+read -p "Do you want to configure secure HTTPS access with a domain name? (Requires a domain pointed at this server's IP) (y/n): " -n 1 -r
+echo ""
+
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    # User chose HTTPS
+    setup_https
+else
+    # User chose HTTP
+    setup_http
+fi
+
+echo -e "\n${GREEN}Setup script finished.${NC}"

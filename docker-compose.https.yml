@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  # NGINX REVERSE PROXY - The new front door
+  nginx:
+    image: nginx:latest
+    container_name: nginx_proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"    # For Let's Encrypt certificate challenge
+      - "443:443"  # For secure HTTPS traffic
+    volumes:
+      # We will create these configuration files and certificate directories
+      - ./nginx/conf:/etc/nginx/conf.d
+      - ./nginx/certs:/etc/letsencrypt
+    depends_on:
+      - api
+      - grafana
+      - influxdb
+
+  # Our existing services, but NO LONGER exposing ports to the host
+  api:
+    build: ./api
+    restart: unless-stopped
+    # PORTS REMOVED: Nginx will handle access
+    env_file: .env
+    environment:
+      - INFLUX_URL=http://influxdb:8086
+    depends_on:
+      - influxdb
+
+  influxdb:
+    image: influxdb:2.7
+    restart: unless-stopped
+    # PORTS REMOVED
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    env_file: .env
+    # ... (rest of influxdb config is the same)
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=password1234
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUX_ORG}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUX_BUCKET}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUX_TOKEN}
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    # PORTS REMOVED
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - influxdb
+
+  # CERTBOT - For Let's Encrypt certificates
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - ./nginx/certs:/etc/letsencrypt
+      - ./nginx/www:/var/www/certbot
+
+volumes:
+  influxdb_data:
+  grafana_data:
